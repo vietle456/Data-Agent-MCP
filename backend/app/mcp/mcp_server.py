@@ -1,34 +1,67 @@
-from fastmcp import FastMCP
+from fastmcp import FastMCP, Context
+from fastmcp.server.lifespan import lifespan
 
 from app.services.duckdb_engine import DuckDBEngine
 from app.core.security_ast import validate_code
+from app.core.config import DB_PATH
 from app.services.sandbox_runner import SandboxRunner
 
-mcp = FastMCP("Data Agent MCP Server")
+
+@lifespan
+async def app_lifespan(server):
+    db = DuckDBEngine(DB_PATH)
+    try:
+        yield {"db": db}
+    finally:
+        db.close()
+
+
+mcp = FastMCP("Data Agent MCP Server", lifespan=app_lifespan)
 
 
 @mcp.tool()
-def inspect_db_schema() -> str:
+def list_tables(ctx: Context) -> list[str]:
     """
-    Returns all table names, column names/types, and 3 sample rows.
-    The agent MUST call this before writing any SQL or Python query.
+    Returns a list of all table names available in the database.
     """
-    with DuckDBEngine("storage/database.duckdb") as db:
-        summary = db.get_schema_summary()
-        return summary
+    db = ctx.lifespan_context["db"]
+    return db.list_tables()
 
 
 @mcp.tool()
-def execute_sql_query(query: str) -> str:
+def describe_table(ctx: Context, table_name: str) -> list[dict]:
+    """
+    Returns the column names and data types for a given table.
+    Args:
+        table_name: The exact name of the table to inspect (use list_tables to get valid names).
+    """
+    db = ctx.lifespan_context["db"]
+    return db.describe_table(table_name)
+
+
+@mcp.tool()
+def sample_table(ctx: Context, table_name: str, limit: int = 3) -> list[dict]:
+    """
+    Returns a small sample of rows from a table to understand its structure and content.
+    Args:
+        table_name: The exact name of the table to sample (use list_tables to get valid names).
+        limit: Number of rows to return. Defaults to 3.
+    """
+    db = ctx.lifespan_context["db"]
+    return db.sample_table(table_name, limit)
+
+
+@mcp.tool()
+def execute_sql_query(ctx: Context, query: str) -> str:
     """
     Executes a read-only SQL query against DuckDB.
     Results are automatically capped at 500 rows.
     Args:
         query: A valid SQL SELECT statement.
     """
-    with DuckDBEngine("storage/database.duckdb") as db:
-        query_result = db.execute_read_query(query)
-        return query_result
+    db = ctx.lifespan_context["db"]
+    query_result = db.execute_read_query(query)
+    return query_result
 
 
 @mcp.tool()

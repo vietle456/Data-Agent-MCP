@@ -3,11 +3,13 @@ from typing import Optional
 from pathlib import Path
 import duckdb
 
+from app.core.config import SCHEMA_CACHE_PATH
+
 
 class DuckDBEngine:
     """Service wrapper for DuckDB analytical database operations."""
 
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(self, db_path: Optional[str | Path] = None):
         # In-memory database or disk-persisted .duckdb file
         self.db_path = db_path or ":memory:"
         self.conn = duckdb.connect(database=self.db_path)
@@ -25,27 +27,36 @@ class DuckDBEngine:
             raise ValueError(f"Unsupported file format: {suffix}")
 
         self.conn.execute(query)
+        self._save_schema_cache(table_name)
         return True
 
-    def get_schema_summary(self) -> str:
-        """Returns table names, columns, data types, and sample rows for LLM context."""
-        tables = self.conn.execute("SHOW TABLES;").fetchall()
-        schema_info = {}
+    def list_tables(self) -> list[str]:
+        tables = self.conn.execute("SHOW TABLES").fetchall()
+        return [table[0] for table in tables]
 
-        for (table_name,) in tables:
-            # Get column names and types
-            col_info = self.conn.execute(f"DESCRIBE {table_name};").fetchall()
-            columns = [{"name": c[0], "type": c[1]} for c in col_info]
+    def describe_table(self, table_name: str) -> list[dict]:
+        rows = self.conn.execute(f"DESCRIBE {table_name}").fetchall()
 
-            # Fetch sample rows
-            samples = (
-                self.conn.execute(f"SELECT * FROM {table_name} LIMIT 3;")
-                .df()
-                .to_dict(orient="records")
-            )
+        return [
+            {
+                "name": row[0],
+                "type": row[1],
+            }
+            for row in rows
+        ]
 
-            schema_info[table_name] = {"columns": columns, "sample_rows": samples}
-        return json.dumps(schema_info, indent=2)
+    def sample_table(
+        self,
+        table_name: str,
+        limit: int = 3,
+    ) -> list[dict]:
+        columns = self.describe_table(table_name)
+
+        rows = self.conn.execute(f"SELECT * FROM {table_name} LIMIT {limit}").fetchall()
+
+        column_names = [column["name"] for column in columns]
+
+        return [dict(zip(column_names, row)) for row in rows]
 
     def execute_read_query(self, query: str) -> str:
         """Executes read-only SQL query with a safety LIMIT clause."""
@@ -68,8 +79,22 @@ class DuckDBEngine:
         except Exception as e:  # pylint: disable=broad-except
             return json.dumps({"success": False, "error": str(e)})
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
+    def close(self):
+        """Close database connection"""
         self.conn.close()
+
+    def _save_schema_cache(self, table_name: str) -> None:
+        """
+        Writes a JSON schema cache file for the given table to storage/cache/.
+        The file is named <table_name>.json and contains the table name and
+        its column names with their DuckDB types.
+        """
+        columns = self.describe_table(table_name)
+        schema = {
+            "table": table_name,
+            "columns": columns,  # [{"name": ..., "type": ...}, ...]
+        }
+
+        SCHEMA_CACHE_PATH.mkdir(parents=True, exist_ok=True)
+        cache_file = SCHEMA_CACHE_PATH / f"{table_name}.json"
+        cache_file.write_text(json.dumps(schema, indent=2), encoding="utf-8")
