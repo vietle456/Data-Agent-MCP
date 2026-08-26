@@ -7,7 +7,7 @@ import duckdb
 class DuckDBEngine:
     """Service wrapper for DuckDB analytical database operations."""
 
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(self, db_path: Optional[str | Path] = None):
         # In-memory database or disk-persisted .duckdb file
         self.db_path = db_path or ":memory:"
         self.conn = duckdb.connect(database=self.db_path)
@@ -38,11 +38,8 @@ class DuckDBEngine:
             columns = [{"name": c[0], "type": c[1]} for c in col_info]
 
             # Fetch sample rows
-            samples = (
-                self.conn.execute(f"SELECT * FROM {table_name} LIMIT 3;")
-                .df()
-                .to_dict(orient="records")
-            )
+            rows = self.conn.execute(f"SELECT * FROM {table_name} LIMIT 3").fetchall()
+            samples = [dict(zip([c[0] for c in col_info], row)) for row in rows]
 
             schema_info[table_name] = {"columns": columns, "sample_rows": samples}
         return json.dumps(schema_info, indent=2)
@@ -68,8 +65,5 @@ class DuckDBEngine:
         except Exception as e:  # pylint: disable=broad-except
             return json.dumps({"success": False, "error": str(e)})
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
+    def close(self):
         self.conn.close()

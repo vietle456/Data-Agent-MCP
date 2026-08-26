@@ -23,8 +23,11 @@ from app.agent.nodes import (
     step_router,
 )
 from app.core.config import MCP_SERVER_PARAMS
+from app.core.logging_config import get_logger
 
 load_dotenv()
+
+logger = get_logger(__name__)
 
 
 async def run_graph(question: str) -> dict:
@@ -33,16 +36,26 @@ async def run_graph(question: str) -> dict:
     the LangGraph state machine — all within the MCP session context so tools
     remain valid throughout execution.
     """
+    logger.debug("[run_graph] Starting MCP stdio client subprocess")
     async with stdio_client(MCP_SERVER_PARAMS) as (read, write):
         async with ClientSession(read, write) as session:
+            logger.debug("[run_graph] MCP session opened — initializing")
             await session.initialize()
+            logger.debug("[run_graph] MCP session initialized")
 
             # Convert MCP tools → LangChain Tool objects
             mcp_tools = await load_mcp_tools(session)
+            logger.debug(
+                "[run_graph] Loaded %d MCP tools: %s",
+                len(mcp_tools),
+                [getattr(t, 'name', str(t)) for t in mcp_tools],
+            )
 
             llm = ChatOpenAI(model="gpt-4o", temperature=0)
+            logger.debug("[run_graph] LLM initialized (model=gpt-4o)")
 
             graph = _build_state_graph(llm, mcp_tools)
+            logger.debug("[run_graph] State graph compiled")
 
             initial_state: AgentState = {
                 "messages": [HumanMessage(content=question)],
@@ -56,10 +69,19 @@ async def run_graph(question: str) -> dict:
                 "final_answer": "",
             }
 
-            return await graph.ainvoke(initial_state)
+            logger.debug("[run_graph] Invoking graph | question=%r", question)
+            result = await graph.ainvoke(initial_state)
+
+            final_answer = result.get("final_answer", "")
+            logger.debug(
+                "[run_graph] Graph execution complete | final_answer_len=%d",
+                len(final_answer),
+            )
+            return result
 
 
 def _build_state_graph(llm, mcp_tools):
+    logger.debug("[_build_state_graph] Building state graph")
     graph = StateGraph(AgentState)
 
     # ── Nodes ─────────────────────────────────────────────────────────────────
@@ -120,4 +142,6 @@ def _build_state_graph(llm, mcp_tools):
     graph.add_edge("fallback_failure", END)
     graph.add_edge("final_formatting", END)
 
-    return graph.compile()
+    compiled = graph.compile()
+    logger.debug("[_build_state_graph] Graph compiled with %d nodes", 9)
+    return compiled
