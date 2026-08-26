@@ -1,34 +1,45 @@
-from fastmcp import FastMCP
+from fastmcp import FastMCP, Context
+from fastmcp.server.lifespan import lifespan
 
 from app.services.duckdb_engine import DuckDBEngine
 from app.core.security_ast import validate_code
+from app.core.config import DB_PATH
 from app.services.sandbox_runner import SandboxRunner
 
-mcp = FastMCP("Data Agent MCP Server")
+
+@lifespan
+async def app_lifespan(server):
+    db = DuckDBEngine(DB_PATH)
+    try:
+        yield {"db": db}
+    finally:
+        db.close()
+
+
+mcp = FastMCP("Data Agent MCP Server", lifespan=app_lifespan)
 
 
 @mcp.tool()
-def inspect_db_schema() -> str:
+def inspect_db_schema(ctx: Context) -> str:
     """
     Returns all table names, column names/types, and 3 sample rows.
     The agent MUST call this before writing any SQL or Python query.
     """
-    with DuckDBEngine("storage/database.duckdb") as db:
-        summary = db.get_schema_summary()
-        return summary
+    db = ctx.lifespan_context["db"]
+    return db.get_schema_summary()
 
 
 @mcp.tool()
-def execute_sql_query(query: str) -> str:
+def execute_sql_query(ctx: Context, query: str) -> str:
     """
     Executes a read-only SQL query against DuckDB.
     Results are automatically capped at 500 rows.
     Args:
         query: A valid SQL SELECT statement.
     """
-    with DuckDBEngine("storage/database.duckdb") as db:
-        query_result = db.execute_read_query(query)
-        return query_result
+    db = ctx.lifespan_context["db"]
+    query_result = db.execute_read_query(query)
+    return query_result
 
 
 @mcp.tool()
