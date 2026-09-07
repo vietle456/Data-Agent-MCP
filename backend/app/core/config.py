@@ -17,4 +17,5 @@ MCP_SERVER_PARAMS = StdioServerParameters(
 )
 
 # Local storage path
-DB_PATH = _BACKEND_DIR / "storage" / "database.duckdb"
+DB_PATH = _BACKEND_DIR / "storage" / "db.duckdb"
+ARTIFACTS_PATH = _BACKEND_DIR / "storage" / "artifacts"

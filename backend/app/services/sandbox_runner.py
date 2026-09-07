@@ -28,9 +28,13 @@ class SandboxRunner:
             script_path = temp_dir / "script.py"
             script_path.write_text(code_str, encoding="utf-8")
 
+            # 2. Pre-create the artifacts dir so scripts can save to
+            #    'artifacts/<filename>' without hitting FileNotFoundError
+            (temp_dir / "artifacts").mkdir(exist_ok=True)
+
             container = None
             try:
-                # 2. Spawn Docker container with 15s timeout
+                # 3. Spawn Docker container with 15s timeout
                 container = self.client.containers.create(
                     image="data-agent-runner:latest",
                     network_mode="none",
@@ -67,9 +71,25 @@ class SandboxRunner:
                     except Exception:
                         pass
 
-            # 3. Copy generated artifact files to server current session directory
+            # 4. Copy generated artifact files to workspace_dir.
+            #    Files saved inside the container's artifacts/ subdir are
+            #    flattened directly into workspace_dir so the final path is
+            #    workspace_dir/filename (e.g. storage/artifacts/filename.png).
             for item in temp_dir.iterdir():
-                if item.name != "script.py":
+                if item.name == "script.py":
+                    continue
+                if item.is_dir() and item.name == "artifacts":
+                    # Flatten: copy each file inside artifacts/ directly to workspace_dir
+                    for artifact_file in item.iterdir():
+                        dest = workspace_dir / artifact_file.name
+                        if artifact_file.is_dir():
+                            if dest.exists():
+                                shutil.rmtree(dest)
+                            shutil.copytree(artifact_file, dest)
+                        else:
+                            shutil.copy2(artifact_file, dest)
+                        artifacts.append(str(dest))
+                else:
                     dest = workspace_dir / item.name
                     if item.is_dir():
                         if dest.exists():

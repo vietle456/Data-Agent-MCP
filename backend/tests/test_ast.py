@@ -1,6 +1,6 @@
 import ast
 import pytest
-from app.core.security_ast import SecurityVisitor, validate_code
+from backend.app.core.security_ast import SecurityVisitor, validate_code
 
 
 def test_dangerous_code_raises_value_error():

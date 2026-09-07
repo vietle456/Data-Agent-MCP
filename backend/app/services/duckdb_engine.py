@@ -2,6 +2,8 @@ import json
 from typing import Optional
 from pathlib import Path
 import duckdb
+import sqlglot
+from sqlglot import expressions as exp
 
 
 class DuckDBEngine:
@@ -44,26 +46,53 @@ class DuckDBEngine:
             schema_info[table_name] = {"columns": columns, "sample_rows": samples}
         return json.dumps(schema_info, indent=2)
 
-    def execute_read_query(self, query: str) -> str:
+    def execute_read_query(self, query: str, max_rows: int = 500) -> dict:
         """Executes read-only SQL query with a safety LIMIT clause."""
-        # Safety: force LIMIT 500 if not present
-        if "LIMIT" not in query.upper():
-            query = f"SELECT * FROM ({query}) AS subq LIMIT 500"
-
         try:
-            result = self.conn.execute(query).df()  # returns pandas DataFrame
+            # Safety: force LIMIT 500 if not present
+            tree = sqlglot.parse_one(query, dialect="duckdb")
 
-            return json.dumps(
-                {
-                    "success": True,
-                    "row_count": len(result),
-                    "columns": list(result.columns),
-                    "data": result.head(10).to_dict(orient="records"),  # first 10 rows
-                    "summary": result.describe().to_dict(),
-                }
-            )
+            if not isinstance(tree, exp.Query):
+                raise ValueError("Only query statements are allowed")
+
+            if tree.args.get("limit") is None:
+                tree = tree.limit(max_rows)
+
+            query = tree.sql(dialect="duckdb")
+
+            # Execute
+            cursor = self.conn.execute(query)
+
+            # column name + declared type from the cursor description
+            columns = [
+                {"name": desc[0], "type": str(desc[1])} for desc in cursor.description
+            ]
+            col_names = [c["name"] for c in columns]
+
+            # raw list-of-tuples
+            rows = [dict(zip(col_names, row)) for row in cursor.fetchall()]
+
+            # lightweight numeric summary computed from raw values
+            summary: dict = {"row_count": len(rows)}
+            for col in columns:
+                name = col["name"]
+                values = [row[name] for row in rows if row[name] is not None]
+                if values and all(isinstance(v, (int, float)) for v in values):
+                    summary[name] = {
+                        "count": len(values),
+                        "min": min(values),
+                        "max": max(values),
+                        "mean": round(sum(values) / len(values), 6),
+                    }
+
+            return {
+                "success": True,
+                "columns": columns,
+                "rows": rows,
+                "summary": summary,
+            }
         except Exception as e:  # pylint: disable=broad-except
-            return json.dumps({"success": False, "error": str(e)})
+            return {"success": False, "error": str(e)}
 
     def close(self):
         self.conn.close()

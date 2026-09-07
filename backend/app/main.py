@@ -9,4 +9,6 @@ async def run_agent(question: str):
 
 
 if __name__ == "__main__":
-    asyncio.run(run_agent("What are the top 5 product categories by revenue?"))
+    asyncio.run(
+        run_agent("Summarize the overall sales trend of each video game genre globally")
+    )

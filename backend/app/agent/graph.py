@@ -7,10 +7,12 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from dotenv import load_dotenv
 
 from app.agent.state import AgentState
+from app.models.plan import Plan
+from app.models.execution_output import ExecutionOutput
 from app.agent.nodes import (
     PlannerNode,
     CodeGenNode,
-    SandboxExecNode,
+    CodeExecNode,
     ErrorCorrectionNode,
     DirectAnswerNode,
     FinalFormattingNode,
@@ -19,7 +21,7 @@ from app.agent.nodes import (
     fallback_failure_node,
     plan_intent,
     ast_eval_router,
-    should_retry,
+    code_exec_router,
     step_router,
 )
 from app.core.config import MCP_SERVER_PARAMS
@@ -48,7 +50,7 @@ async def run_graph(question: str) -> dict:
             logger.debug(
                 "[run_graph] Loaded %d MCP tools: %s",
                 len(mcp_tools),
-                [getattr(t, 'name', str(t)) for t in mcp_tools],
+                [getattr(t, "name", str(t)) for t in mcp_tools],
             )
 
             llm = ChatOpenAI(model="gpt-4o", temperature=0)
@@ -59,14 +61,21 @@ async def run_graph(question: str) -> dict:
 
             initial_state: AgentState = {
                 "messages": [HumanMessage(content=question)],
-                "plan": {},
+                "plan": Plan(intent="Code execution", steps=[]),
                 "current_step_index": 0,
                 "schema_context": "",
                 "generated_code": "",
                 "retry_count": 0,
-                "execution_output": {},
                 "ast_violation": False,
                 "final_answer": "",
+                # Sentinel so nodes can safely read .data / .stdout before any step runs
+                "execution_output": ExecutionOutput(
+                    success=False,
+                    error=None,
+                    artifacts=[],
+                    data=None,
+                    stdout=None,
+                ),
             }
 
             logger.debug("[run_graph] Invoking graph | question=%r", question)
@@ -88,7 +97,7 @@ def _build_state_graph(llm, mcp_tools):
     graph.add_node("planner", PlannerNode(llm, mcp_tools))
     graph.add_node("code_gen", CodeGenNode(llm))
     graph.add_node("ast_eval", ast_eval_node)
-    graph.add_node("sandbox_exec", SandboxExecNode(mcp_tools))
+    graph.add_node("code_exec", CodeExecNode(mcp_tools))
     graph.add_node("advance_step", advance_step)
     graph.add_node("error_correction", ErrorCorrectionNode(llm))
     graph.add_node("direct_answer", DirectAnswerNode(llm))
@@ -111,17 +120,23 @@ def _build_state_graph(llm, mcp_tools):
     # code_gen → safety gate
     graph.add_edge("code_gen", "ast_eval")
 
-    # ast_eval → bypass sandbox on violation, run sandbox if safe
+    # ast_eval → safe: proceed to execution
+    #           → retry: violation found, retries remaining — send to error_correction
+    #           → give_up: violation found, budget exhausted — terminate
     graph.add_conditional_edges(
         "ast_eval",
         ast_eval_router,
-        {"safe": "sandbox_exec", "violation": "error_correction"},
+        {
+            "safe": "code_exec",
+            "retry": "error_correction",
+            "give_up": "fallback_failure",
+        },
     )
 
-    # sandbox_exec → retry / give up / advance
+    # code_exec → retry / give up / advance
     graph.add_conditional_edges(
-        "sandbox_exec",
-        should_retry,
+        "code_exec",
+        code_exec_router,
         {
             "success": "advance_step",
             "retry": "error_correction",
