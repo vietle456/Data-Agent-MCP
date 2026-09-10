@@ -1,8 +1,13 @@
+import logging
 import tempfile
 from pathlib import Path
+
 import docker
+import docker.errors
 
 from app.core.config import UPLOADS_PATH, SQL_RESULTS_PATH, ARTIFACTS_PATH
+
+logger = logging.getLogger(__name__)
 
 
 def _snapshot(directory: Path) -> set[Path]:
@@ -14,7 +19,15 @@ def _snapshot(directory: Path) -> set[Path]:
 
 class SandboxRunner:
     def __init__(self) -> None:
-        self.client = docker.from_env()
+        try:
+            self.client = docker.from_env()
+        except docker.errors.DockerException as exc:
+            logger.error(
+                "[SandboxRunner] Cannot connect to Docker daemon — "
+                "make sure Docker is running. Detail: %s",
+                exc,
+            )
+            raise
 
     def execute(self, code_str: str) -> dict:
         # Ensure all bound host directories exist before Docker mounts them.
@@ -78,9 +91,32 @@ class SandboxRunner:
                 stdout_str = container.logs(stdout=True, stderr=False).decode("utf-8")
                 stderr_str = container.logs(stdout=False, stderr=True).decode("utf-8")
 
-            except Exception as e:
+            except docker.errors.DockerException as e:
+                logger.error(
+                    "[SandboxRunner] Docker error during container execution — "
+                    "is Docker running? Detail: %s",
+                    e,
+                )
                 stderr_str = str(e)
-                exit_code = 124 if "timed out" in str(e).lower() else 1
+                exit_code = 1
+                if container:
+                    try:
+                        container.kill()
+                    except Exception:
+                        pass
+            except Exception as e:
+                if "timed out" in str(e).lower():
+                    logger.warning(
+                        "[SandboxRunner] Container execution timed out: %s", e
+                    )
+                    exit_code = 124
+                else:
+                    logger.error(
+                        "[SandboxRunner] Unexpected error during container execution: %s",
+                        e,
+                    )
+                    exit_code = 1
+                stderr_str = str(e)
                 if container:
                     try:
                         container.kill()
