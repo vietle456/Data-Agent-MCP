@@ -3,7 +3,7 @@ from fastmcp.server.lifespan import lifespan
 
 from app.services.duckdb_engine import DuckDBEngine
 from app.core.security_ast import validate_python, validate_sql
-from app.core.config import DB_PATH, ARTIFACTS_PATH
+from app.core.config import DB_PATH
 from app.services.sandbox_runner import SandboxRunner
 
 
@@ -66,9 +66,8 @@ def execute_python_analysis(code_str: str) -> dict:
             "artifacts": [],
         }
 
-    # Docker sandbox execution — output artifacts land in storage/artifacts/
-    ARTIFACTS_PATH.mkdir(parents=True, exist_ok=True)
-    result = SandboxRunner().execute(code_str, workspace_dir=ARTIFACTS_PATH)
+    # Docker sandbox execution — output artifacts land in storage/output/artifacts/
+    result = SandboxRunner().execute(code_str)
     return result
 
 

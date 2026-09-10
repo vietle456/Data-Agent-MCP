@@ -1,25 +1,33 @@
-import shutil
 import tempfile
 from pathlib import Path
 import docker
+
+from app.core.config import UPLOADS_PATH, SQL_RESULTS_PATH, ARTIFACTS_PATH
+
+
+def _snapshot(directory: Path) -> set[Path]:
+    """Return the set of all files currently present under *directory*."""
+    if not directory.exists():
+        return set()
+    return {p for p in directory.rglob("*") if p.is_file()}
 
 
 class SandboxRunner:
     def __init__(self) -> None:
         self.client = docker.from_env()
 
-    def execute(self, code_str: str, workspace_dir: Path | str | None = None) -> dict:
-        if workspace_dir is None:
-            workspace_dir = Path(".")
-        elif isinstance(workspace_dir, str):
-            workspace_dir = Path(workspace_dir)
-
-        workspace_dir.mkdir(parents=True, exist_ok=True)
+    def execute(self, code_str: str) -> dict:
+        # Ensure all bound host directories exist before Docker mounts them.
+        UPLOADS_PATH.mkdir(parents=True, exist_ok=True)
+        SQL_RESULTS_PATH.mkdir(parents=True, exist_ok=True)
+        ARTIFACTS_PATH.mkdir(parents=True, exist_ok=True)
 
         stdout_str = ""
         stderr_str = ""
         exit_code = 0
-        artifacts = []
+
+        # Snapshot existing output artifacts so we can report only what this run produced.
+        before_output = _snapshot(ARTIFACTS_PATH)
 
         with tempfile.TemporaryDirectory() as tmp:
             temp_dir = Path(tmp)
@@ -28,13 +36,12 @@ class SandboxRunner:
             script_path = temp_dir / "script.py"
             script_path.write_text(code_str, encoding="utf-8")
 
-            # 2. Pre-create the artifacts dir so scripts can save to
-            #    'artifacts/<filename>' without hitting FileNotFoundError
-            (temp_dir / "artifacts").mkdir(exist_ok=True)
-
             container = None
             try:
-                # 3. Spawn Docker container with 15s timeout
+                # 2. Spawn Docker container with 15s timeout.
+                #    Storage directories are bind-mounted directly, so files
+                #    written inside the container appear on the host immediately
+                #    with no extra copy step required.
                 container = self.client.containers.create(
                     image="data-agent-runner:latest",
                     network_mode="none",
@@ -44,7 +51,22 @@ class SandboxRunner:
                         str(temp_dir): {
                             "bind": "/workspace",
                             "mode": "rw",
-                        }
+                        },
+                        # Read-only: container only reads uploaded source files.
+                        str(UPLOADS_PATH): {
+                            "bind": "/workspace/input",
+                            "mode": "ro",
+                        },
+                        # Read-write: container writes query results (parquet, csv…).
+                        str(SQL_RESULTS_PATH): {
+                            "bind": "/workspace/intermediate",
+                            "mode": "rw",
+                        },
+                        # Read-write: container writes output artifacts (charts, reports…).
+                        str(ARTIFACTS_PATH): {
+                            "bind": "/workspace/output",
+                            "mode": "rw",
+                        },
                     },
                     detach=True,
                 )
@@ -71,33 +93,10 @@ class SandboxRunner:
                     except Exception:
                         pass
 
-            # 4. Copy generated artifact files to workspace_dir.
-            #    Files saved inside the container's artifacts/ subdir are
-            #    flattened directly into workspace_dir so the final path is
-            #    workspace_dir/filename (e.g. storage/artifacts/filename.png).
-            for item in temp_dir.iterdir():
-                if item.name == "script.py":
-                    continue
-                if item.is_dir() and item.name == "artifacts":
-                    # Flatten: copy each file inside artifacts/ directly to workspace_dir
-                    for artifact_file in item.iterdir():
-                        dest = workspace_dir / artifact_file.name
-                        if artifact_file.is_dir():
-                            if dest.exists():
-                                shutil.rmtree(dest)
-                            shutil.copytree(artifact_file, dest)
-                        else:
-                            shutil.copy2(artifact_file, dest)
-                        artifacts.append(str(dest))
-                else:
-                    dest = workspace_dir / item.name
-                    if item.is_dir():
-                        if dest.exists():
-                            shutil.rmtree(dest)
-                        shutil.copytree(item, dest)
-                    else:
-                        shutil.copy2(item, dest)
-                    artifacts.append(str(dest))
+        # 3. Collect Python-produced artifact paths only (new files under ARTIFACTS_PATH).
+        #    SQL result files written to SQL_RESULTS_PATH are intentionally excluded.
+        new_output = _snapshot(ARTIFACTS_PATH) - before_output
+        artifacts = [str(p) for p in sorted(new_output)]
 
         return {
             "stdout": stdout_str,

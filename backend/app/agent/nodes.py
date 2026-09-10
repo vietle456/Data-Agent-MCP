@@ -1,11 +1,17 @@
 import asyncio
 import json
+import uuid
+from pathlib import Path
+
+import pandas as pd
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 from app.agent.state import AgentState
 from app.models.plan import Plan
-from app.models.execution_output import ExecutionOutput
+from app.models.execution_output import SQLExecutionResult, PythonExecutionResult
+from app.models.artifact_schema import DatasetArtifact
 from app.core.logging_config import get_logger
+from app.core.config import SQL_RESULTS_PATH
 from app.prompt.prompt import (
     PLANNER_SYSTEM_PROMPT,
     CODE_GEN_SYSTEM_PROMPT,
@@ -171,16 +177,63 @@ class CodeGenNode:
             current_step.description,
         )
 
-        # Surface previous execution output so the LLM can reference prior results
-        exec_out = state["execution_output"]
-        prev_output = (
-            {"data": exec_out.data, "stdout": exec_out.stdout}
-            if (exec_out.data or exec_out.stdout)
-            else None
-        )
+        # Surface previous execution output so the LLM can reference prior results.
+        # Strategy differs by the *previous* step's type:
+        #   • SQL_QUERY  → pass a compact dataset reference (filename, schema, path)
+        #                  so the LLM can emit `pd.read_parquet(path)` rather than
+        #                  receiving hundreds of rows verbatim.
+        #   • PYTHON / first step → pass stdout as-is (short text, charts, etc.)
+        prev_step = steps[index - 1] if index > 0 else None
+        prev_step_type = prev_step.type if prev_step else None
+
+        if prev_step_type == "SQL_QUERY":
+            # DatasetArtifact holds the host storage_path and the container_path;
+            # columns/row_count come from sql_execution_output
+            sql_output = state.get("sql_execution_output")
+            datasets: dict = state.get("datasets") or {}
+            # Use the most-recently added dataset artifact
+            artifact = next(iter(datasets.values()), None) if datasets else None
+            parquet_filename = next(iter(datasets.keys()), None) if datasets else None
+
+            if artifact and parquet_filename and sql_output:
+                col_names = [c.get("name", c) for c in (sql_output.columns or [])]
+                # SQL runs on the host (via DuckDB/MCP) → use the local storage_path.
+                # Python runs inside Docker → use the container_path (bind-mounted).
+                parquet_ref = (
+                    artifact.storage_path
+                    if current_step.type == "SQL_QUERY"
+                    else artifact.container_path
+                )
+                prev_output_section = f"""\
+Previous step result (SQL query — data exported to parquet):
+  File name   : {parquet_filename}
+  Storage path: {parquet_ref}
+  Row count   : {sql_output.row_count}
+  Columns     : {col_names}
+  Preview     : {sql_output.preview}
+
+Use `pd.read_parquet("{parquet_ref}")` to load this dataset.\
+"""
+            else:
+                # Artifact or sql_execution_output not found in state (edge case)
+                prev_output_section = (
+                    "Previous step result (SQL query): No output available"
+                )
+        elif prev_step_type == "PYTHON":
+            python_output = state.get("python_execution_output")
+            stdout = python_output.stdout if python_output else None
+            if stdout:
+                prev_output_section = (
+                    f"Previous step result (Python script stdout):\n{stdout}"
+                )
+            else:
+                prev_output_section = "No previous step output"
+        else:
+            prev_output_section = "No previous step output"
 
         steps_json = json.dumps([s.model_dump() for s in steps], indent=2)
-        context_message = HumanMessage(content=f"""
+        context_message = HumanMessage(
+            content=f"""
 Schema:
 {state['schema_context']}
 
@@ -191,9 +244,9 @@ Current step to implement (step {index + 1} of {len(steps)}):
   Type: {current_step.type}
   Description: {current_step.description}
 
-Previous step output (if any):
-{prev_output or "No previous step output"}
-""")
+{prev_output_section}
+"""
+        )
 
         messages = [
             SystemMessage(content=CODE_GEN_SYSTEM_PROMPT),
@@ -249,6 +302,8 @@ class CodeExecNode:
         logger.debug("[CodeExecNode] START | step=%d | type=%s", step_num, step_type)
         logger.debug("[CodeExecNode] Submitting to executor:\n%s", code)
 
+        dataset_artifact: DatasetArtifact | None = None  # populated by SQL branch only
+
         if step_type == "SQL_QUERY":
             sql_tool = self._get_tool("execute_sql_query")
             logger.debug("[CodeExecNode] Invoking MCP tool 'execute_sql_query'")
@@ -261,11 +316,14 @@ class CodeExecNode:
             # against future adapter changes that may return a list or dict.
             if not isinstance(raw_result, str):
                 raw_result = json.dumps(raw_result)
-            sql_result = json.loads(json.loads(raw_result)[0]["text"])
+            raw_list = json.loads(raw_result)
+            raw_item = raw_list[0]
+            sql_result = json.loads(raw_item["text"])
 
             success = sql_result.get("success", True)
             error_msg = sql_result.get("error", "") if not success else ""
-            rows = sql_result.get("data", [])
+            rows = sql_result.get("rows", sql_result.get("data", []))
+            row_count = sql_result["summary"]["row_count"]
 
             logger.debug(
                 "[CodeExecNode] SQL execution complete | success=%s, rows=%s",
@@ -275,17 +333,58 @@ class CodeExecNode:
             if error_msg:
                 logger.debug("[CodeExecNode] SQL error:\n%s", error_msg)
 
-            execution_output = ExecutionOutput(
+            parquet_path: str | None = None
+            result_id: str | None = None
+            if success and rows:
+                try:
+                    result_id = str(uuid.uuid4())
+                    SQL_RESULTS_PATH.mkdir(parents=True, exist_ok=True)
+                    parquet_filename = f"result_{result_id}.parquet"
+                    parquet_path = str(SQL_RESULTS_PATH / parquet_filename)
+                    pd.DataFrame(rows).to_parquet(parquet_path, index=False)
+                    logger.debug(
+                        "[CodeExecNode] SQL result exported to parquet: %s",
+                        parquet_path,
+                    )
+                    dataset_artifact = DatasetArtifact(
+                        id=result_id,
+                        storage_path=parquet_path,
+                        container_path=f"/workspace/intermediate/{parquet_filename}",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[CodeExecNode] Failed to export SQL result to parquet: %s",
+                        exc,
+                    )
+
+            sql_exec_output = SQLExecutionResult(
                 success=success,
                 error=error_msg if error_msg else None,
-                artifacts=[],
-                data=sql_result.get("data"),
-                stdout=(
-                    json.dumps(sql_result.get("data", sql_result), indent=2)
-                    if success
-                    else None
-                ),
+                columns=sql_result.get("columns", []),
+                preview=rows[:5] if rows else [],
+                row_count=row_count,
             )
+
+            # Add execution output to messages so the next code_gen step can reference it
+            output_message = HumanMessage(
+                content=f"Step {step_num} SQL execution: success={success}, rows={len(rows) if rows else 0}"
+            )
+
+            result: dict = {
+                "sql_execution_output": sql_exec_output,
+                "execution_error": error_msg if not success else None,
+                "messages": [output_message],
+            }
+
+            # Merge the new DatasetArtifact into the state's datasets dict (SQL steps only)
+            if dataset_artifact is not None:
+                parquet_filename = Path(dataset_artifact.storage_path).name
+                result["datasets"] = {
+                    **(state.get("datasets") or {}),
+                    parquet_filename: dataset_artifact,
+                }
+
+            return result
 
         else:  # PYTHON
             python_tool = self._get_tool("execute_python_analysis")
@@ -324,25 +423,23 @@ class CodeExecNode:
             if stderr:
                 logger.debug("[CodeExecNode] stderr:\n%s", stderr)
 
-            # Build ExecutionOutput inside the branch — avoids re-reading from
-            # `result` after the branch and eliminates the risk of key mismatches.
-            execution_output = ExecutionOutput(
+            python_exec_output = PythonExecutionResult(
                 success=exit_code == 0,
-                error=stderr if stderr else None,
+                stdout=stdout,  # str, required — already defaulted to "" above
+                stderr=stderr if stderr else None,
                 artifacts=artifacts,
-                data=result.get("data"),
-                stdout=stdout,
             )
 
-        # Add execution output to messages so the next code_gen step can reference it
-        output_message = HumanMessage(
-            content=f"Step {step_num} execution output:\n{execution_output.stdout or ''}"
-        )
+            # Add execution output to messages so the next code_gen step can reference it
+            output_message = HumanMessage(
+                content=f"Step {step_num} execution output:\n{stdout}"
+            )
 
-        return {
-            "execution_output": execution_output,
-            "messages": [output_message],
-        }
+            return {
+                "python_execution_output": python_exec_output,
+                "execution_error": stderr if stderr and exit_code != 0 else None,
+                "messages": [output_message],
+            }
 
 
 class ErrorCorrectionNode:
@@ -354,7 +451,7 @@ class ErrorCorrectionNode:
     async def __call__(self, state: AgentState) -> dict:
         steps = state["plan"].steps
         current_step = steps[state["current_step_index"]]
-        error = state["execution_output"].error
+        error = state["execution_error"]
         retry_count = state["retry_count"] + 1
 
         logger.debug(
@@ -366,7 +463,8 @@ class ErrorCorrectionNode:
 
         messages = [
             SystemMessage(content=ERROR_CORRECTION_SYSTEM_PROMPT),
-            HumanMessage(content=f"""
+            HumanMessage(
+                content=f"""
 Original question:
 {state['messages'][0].content}
 
@@ -388,7 +486,8 @@ Error (attempt {retry_count} of 3):
 ```
 {error}
 ```
-"""),
+"""
+            ),
         ]
 
         logger.debug("[ErrorCorrectionNode] Calling LLM for corrected code")
@@ -437,13 +536,15 @@ class DirectAnswerNode:
 
         messages = [
             SystemMessage(content=FINAL_ANSWER_SYSTEM_PROMPT),
-            HumanMessage(content=f"""
+            HumanMessage(
+                content=f"""
 User question:
 {state['messages'][0].content}
 
 Guidance:
 {answer_step.description}
-"""),
+"""
+            ),
         ]
 
         logger.debug("[DirectAnswerNode] Calling LLM for direct answer")
@@ -466,29 +567,35 @@ class FinalFormattingNode:
         self.llm = llm
 
     async def __call__(self, state: AgentState) -> dict:
-        exec_out = state["execution_output"]
-        # Serialise structured data to a JSON string — prevents None from
-        # rendering literally as the string 'None' inside the LLM prompt.
-        data_str = (
-            json.dumps(exec_out.data, indent=2) if exec_out.data is not None else ""
-        )
-        exec_str = exec_out.stdout or ""
+        python_out = state.get("python_execution_output")
+        exec_str = python_out.stdout or "" if python_out else ""
+
+        # Build a compact summary of the SQL execution result
+        sql_out = state.get("sql_execution_output")
+        dataset_summary = ""
+        if sql_out and sql_out.row_count is not None:
+            col_names = [c.get("name", str(c)) for c in (sql_out.columns or [])]
+            dataset_summary = (
+                f"\n\nSQL execution result: {sql_out.row_count} rows, columns={col_names}"
+            )
 
         artifact_note = ""
-        if exec_out.artifacts:
+        if python_out and python_out.artifacts:
             artifact_note = "\n\nGenerated artifacts (charts/files):\n" + "\n".join(
-                exec_out.artifacts
+                python_out.artifacts
             )
 
         messages = [
             SystemMessage(content=FINAL_ANSWER_SYSTEM_PROMPT),
-            HumanMessage(content=f"""
+            HumanMessage(
+                content=f"""
 User question:
 {state['messages'][0].content}
 
 Execution outputs:
-{data_str}{exec_str}{artifact_note}
-"""),
+{exec_str}{dataset_summary}{artifact_note}
+"""
+            ),
         ]
 
         logger.debug("[FinalFormattingNode] Calling LLM to synthesize final answer")
@@ -526,25 +633,13 @@ def ast_eval_node(state: AgentState) -> dict:
         logger.warning("[ast_eval_node] SyntaxError during AST parse: %s", e)
         return {
             "ast_violation": True,
-            "execution_output": ExecutionOutput(
-                success=False,
-                error=f"SyntaxError in generated code: {str(e)}",
-                data=None,
-                stdout=None,
-                artifacts=[],
-            ),
+            "execution_error": f"SyntaxError in generated code: {str(e)}",
         }
     except ValueError as e:
         logger.warning("[ast_eval_node] AST VIOLATION detected: %s", e)
         return {
             "ast_violation": True,
-            "execution_output": ExecutionOutput(
-                success=False,
-                error=f"AST Security Violation: {str(e)}",
-                data=None,
-                stdout=None,
-                artifacts=[],
-            ),
+            "execution_error": f"AST Security Violation: {str(e)}",
         }
 
 
@@ -611,7 +706,10 @@ def ast_eval_router(state: AgentState) -> str:
 
 def code_exec_router(state: AgentState) -> str:
     """After code execution: advance on success, retry on failure, or give up."""
-    success = state["execution_output"].success
+    sql_out = state.get("sql_execution_output")
+    python_out = state.get("python_execution_output")
+    exec_out = sql_out or python_out
+    success = exec_out.success if exec_out is not None else False
     retry_count = state["retry_count"]
 
     if success:

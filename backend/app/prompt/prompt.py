@@ -23,14 +23,27 @@ CRITICAL RULE — Schema availability:
 
 Then produce a concise, step-by-step analytical plan that will answer the question. \
 Each step must be one of the following action types:
-  - SQL_QUERY   — retrieve or aggregate data from the database
-  - PYTHON      — perform calculations, transformations, or visualizations in Python
+  - SQL_QUERY   — retrieve, filter, aggregate, join, or statistically analyze tabular data from the database
+  - PYTHON      — perform visualizations or advanced mathematical computations that SQL cannot express
   - ANSWER      — synthesize results and state the final answer to the user
 
-Rules:
-- Prefer SQL for filtering, grouping, joining, and aggregation.
-- Use Python only when SQL cannot express the logic (e.g. statistical modeling, chart generation, \
-  multi-step pandas transformation).
+Tool-selection rules (CRITICAL — follow strictly):
+- Use SQL_QUERY for ALL of the following:
+    • Filtering rows (WHERE, HAVING)
+    • Selecting and projecting columns
+    • Grouping and aggregation (GROUP BY, COUNT, SUM, AVG, MIN, MAX, etc.)
+    • Joining tables
+    • Sorting (ORDER BY)
+    • Window functions (RANK, ROW_NUMBER, running totals, etc.)
+    • Built-in statistical functions available in the database (stddev, variance, percentile, etc.)
+    • Any other operation that manipulates or summarizes tabular data the database can handle
+- Use PYTHON **only** for:
+    • Data visualization (charts, plots, graphs — e.g. matplotlib, plotly)
+    • Advanced mathematical or statistical computations not expressible in SQL
+      (e.g. Pearson / Spearman correlation, linear regression, clustering, PCA, FFT)
+    • Multi-step transformations that genuinely require pandas/numpy after SQL has retrieved the data
+- Do NOT use Python as a substitute for SQL queries. If the logic can be done in SQL, it MUST be SQL.
+- Do NOT use SQL for visualization or advanced math — those belong in Python.
 - Keep each step atomic — one clear action per step.
 - Never hallucinate column names. Only reference columns that exist in the provided schema.
 - If intent is "Direct answer", steps must contain only a single ANSWER entry.
@@ -75,6 +88,18 @@ Generate the code for the CURRENT step indicated in the plan. Produce exactly ON
   - A valid SQL query (if the step is SQL_QUERY)
   - A valid Python script (if the step is PYTHON)
 
+Tool selection (CRITICAL — enforce before writing any code):
+  - SQL_QUERY is the primary tool for ALL data manipulation on tabular data:
+      filtering, selecting, grouping, aggregating, joining, sorting, window functions,
+      and any built-in statistical functions the database supports (stddev, variance,
+      percentile_cont, etc.).
+  - PYTHON is reserved exclusively for:
+      (a) Visualization — generating charts/plots using matplotlib or plotly.
+      (b) Advanced math/statistics not expressible in SQL — e.g. Pearson/Spearman
+          correlation, linear regression, PCA, clustering, FFT.
+  - Do NOT write Python to do what SQL can already do (filtering, grouping, aggregation, etc.).
+  - Do NOT write SQL to produce charts or run advanced statistical models.
+
 SQL rules:
   - Write read-only SELECT statements only. No INSERT, UPDATE, DELETE, DROP, or DDL.
   - Always include a LIMIT clause (max 500 rows) unless the step explicitly requires aggregation \
@@ -83,8 +108,9 @@ SQL rules:
 
 Python rules:
   - Assume query results from previous SQL steps are available as a pandas DataFrame named `df`.
-  - For chart generation, use matplotlib or plotly. Save charts to the `artifacts/` directory.
-  - Do not use shell commands, file I/O outside `artifacts/`, or network calls.
+  - For chart generation, use matplotlib or plotly. Save charts to `/workspace/output/`.
+  - SQL result parquet files from previous steps are available at `/workspace/intermediate/`.
+  - Do not use shell commands, file I/O outside `/workspace/output/`, or network calls.
   - Do not import libraries outside the standard data science stack \
     (pandas, numpy, scipy, matplotlib, plotly, sklearn).
 
@@ -99,9 +125,9 @@ You will receive a Python or SQL code string. Your job is to identify any unsafe
 operations BEFORE execution.
 
 For Python, flag:
-  - Any use of `exec`, `eval`, `__import__`, `os`, `sys`, `subprocess`, `open` (outside artifacts/), \
+  - Any use of `exec`, `eval`, `__import__`, `os`, `sys`, `subprocess`, `open` (outside /workspace/output/), \
     `socket`, or any network/filesystem access outside the sandbox.
-  - Any attempt to access, modify, or delete files outside `artifacts/`.
+  - Any attempt to access, modify, or delete files outside `/workspace/output/`.
   - Any infinite loops or unrestricted recursion.
 
 For SQL, flag:

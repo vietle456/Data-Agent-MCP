@@ -8,7 +8,6 @@ from dotenv import load_dotenv
 
 from app.agent.state import AgentState
 from app.models.plan import Plan
-from app.models.execution_output import ExecutionOutput
 from app.agent.nodes import (
     PlannerNode,
     CodeGenNode,
@@ -68,14 +67,10 @@ async def run_graph(question: str) -> dict:
                 "retry_count": 0,
                 "ast_violation": False,
                 "final_answer": "",
-                # Sentinel so nodes can safely read .data / .stdout before any step runs
-                "execution_output": ExecutionOutput(
-                    success=False,
-                    error=None,
-                    artifacts=[],
-                    data=None,
-                    stdout=None,
-                ),
+                "datasets": {},
+                "sql_execution_output": None,
+                "python_execution_output": None,
+                "execution_error": None,
             }
 
             logger.debug("[run_graph] Invoking graph | question=%r", question)

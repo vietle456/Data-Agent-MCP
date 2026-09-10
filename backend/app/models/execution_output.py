@@ -3,7 +3,16 @@ from pydantic import BaseModel
 
 class ExecutionOutput(BaseModel):
     success: bool
+
+
+class SQLExecutionResult(ExecutionOutput):
+    row_count: int | None
+    columns: list[dict]
+    preview: list[dict]
     error: str | None
-    artifacts: list[str]  # files produced (Python only)
-    data: dict | None  # structured result (SQL: {columns, rows, summary})
-    stdout: str | None  # raw stdout (Python sandbox only)
+
+
+class PythonExecutionResult(ExecutionOutput):
+    stdout: str
+    stderr: str | None
+    artifacts: list[str]
