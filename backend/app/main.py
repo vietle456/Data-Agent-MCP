@@ -1,14 +1,17 @@
-import asyncio
+import uvicorn
+from fastapi import FastAPI
 
 from app.agent.graph import run_graph
+from app.models.request import QuestionRequest
+
+app = FastAPI(title="Data Agent MCP", version="1.0.0")
 
 
-async def run_agent(question: str):
-    result = await run_graph(question)
-    print(result["final_answer"])
+@app.post("/ask")
+async def ask(request: QuestionRequest):
+    result = await run_graph(request.question)
+    return {"answer": result["final_answer"]}
 
 
 if __name__ == "__main__":
-    asyncio.run(
-        run_agent("Summarize the overall sales trend of each video game genre globally")
-    )
+    uvicorn.run(app, host="localhost", port=8000)
