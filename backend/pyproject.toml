@@ -7,7 +7,7 @@ name = "dataagent-backend"
 version = "0.1.0"
 description = "DataAgent MCP Backend"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 dependencies = [
     "fastapi[standard]",
     "langgraph",
@@ -15,7 +15,11 @@ dependencies = [
     "pandas",
     "duckdb",
     "pytest",
-    "docker"
+    "docker",
+    "langchain>=1.4.2",
+    "langsmith[openai-agents]>=0.13.0",
+    "sqlglot>=30.18.0",
+    "langchain-mcp-adapters>=0.3.2",
 ]
 
 [tool.setuptools.packages.find]

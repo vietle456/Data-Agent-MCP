@@ -49,4 +49,4 @@ htmlcov/
 # Local Database
 backend/storage
 
-
+backend/uv.lock

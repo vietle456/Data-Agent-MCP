@@ -1,6 +1,0 @@
-fastapi[standard]
-langgraph
-langchain-openai
-pandas
-duckdb
-pytest

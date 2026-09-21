@@ -3,22 +3,24 @@ import json
 import uuid
 from pathlib import Path
 
+import duckdb
 import pandas as pd
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-
 from app.agent.state import AgentState
-from app.models.plan import Plan
-from app.models.execution_output import SQLExecutionResult, PythonExecutionResult
-from app.models.artifact_schema import DatasetArtifact
-from app.core.logging_config import get_logger
 from app.core.config import SQL_RESULTS_PATH
+from app.core.logging_config import get_logger
+from app.core.security_ast import validate_python, validate_sql
+from app.exceptions import SqlResultTooLargeError
+from app.models.artifact_schema import DatasetArtifact
+from app.models.execution_output import PythonExecutionResult, SQLExecutionResult
+from app.models.plan import Plan
 from app.prompt.prompt import (
-    PLANNER_SYSTEM_PROMPT,
-    CODE_GEN_SYSTEM_PROMPT,
+    CODE_GEN_PYTHON_SYSTEM_PROMPT,
+    CODE_GEN_SQL_SYSTEM_PROMPT,
     ERROR_CORRECTION_SYSTEM_PROMPT,
     FINAL_ANSWER_SYSTEM_PROMPT,
+    PLANNER_SYSTEM_PROMPT,
 )
-from app.core.security_ast import validate_python, validate_sql
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 logger = get_logger(__name__)
 
@@ -39,6 +41,8 @@ class _Route:
     SUCCESS = "success"
     DONE = "done"
     NEXT_STEP = "next_step"
+    SQL = "sql"
+    PYTHON = "python"
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
@@ -210,7 +214,7 @@ Previous step result (SQL query — data exported to parquet):
   Storage path: {parquet_ref}
   Row count   : {sql_output.row_count}
   Columns     : {col_names}
-  Preview     : {sql_output.preview}
+  Preview     : {sql_output.rows[:10]}
 
 Use `pd.read_parquet("{parquet_ref}")` to load this dataset.\
 """
@@ -235,7 +239,7 @@ Use `pd.read_parquet("{parquet_ref}")` to load this dataset.\
         context_message = HumanMessage(
             content=f"""
 Schema:
-{state['schema_context']}
+{state["schema_context"]}
 
 Full plan ({len(steps)} steps):
 {steps_json}
@@ -248,8 +252,13 @@ Current step to implement (step {index + 1} of {len(steps)}):
 """
         )
 
+        code_gen_prompt = (
+            CODE_GEN_SQL_SYSTEM_PROMPT
+            if current_step.type == "SQL_QUERY"
+            else CODE_GEN_PYTHON_SYSTEM_PROMPT
+        )
         messages = [
-            SystemMessage(content=CODE_GEN_SYSTEM_PROMPT),
+            SystemMessage(content=code_gen_prompt),
             context_message,
         ]
 
@@ -333,6 +342,10 @@ class CodeExecNode:
             if error_msg:
                 logger.debug("[CodeExecNode] SQL error:\n%s", error_msg)
 
+            # TODO
+            if row_count > 100:
+                raise SqlResultTooLargeError(row_count=row_count, limit=100)
+
             parquet_path: str | None = None
             result_id: str | None = None
             if success and rows:
@@ -351,17 +364,18 @@ class CodeExecNode:
                         storage_path=parquet_path,
                         container_path=f"/workspace/intermediate/{parquet_filename}",
                     )
-                except Exception as exc:
+                except OSError as exc:
                     logger.warning(
                         "[CodeExecNode] Failed to export SQL result to parquet: %s",
                         exc,
                     )
 
             sql_exec_output = SQLExecutionResult(
+                id=result_id or "",
                 success=success,
                 error=error_msg if error_msg else None,
                 columns=sql_result.get("columns", []),
-                preview=rows[:5] if rows else [],
+                rows=rows,
                 row_count=row_count,
             )
 
@@ -466,11 +480,11 @@ class ErrorCorrectionNode:
             HumanMessage(
                 content=f"""
 Original question:
-{state['messages'][0].content}
+{state["messages"][0].content}
 
 Schema:
 ```
-{state['schema_context']}
+{state["schema_context"]}
 ```
 
 Step being corrected:
@@ -479,7 +493,7 @@ Step being corrected:
 
 Code that was executed:
 ```
-{state['generated_code']}
+{state["generated_code"]}
 ```
 
 Error (attempt {retry_count} of 3):
@@ -539,7 +553,7 @@ class DirectAnswerNode:
             HumanMessage(
                 content=f"""
 User question:
-{state['messages'][0].content}
+{state["messages"][0].content}
 
 Guidance:
 {answer_step.description}
@@ -567,33 +581,16 @@ class FinalFormattingNode:
         self.llm = llm
 
     async def __call__(self, state: AgentState) -> dict:
-        python_out = state.get("python_execution_output")
-        exec_str = python_out.stdout or "" if python_out else ""
-
-        # Build a compact summary of the SQL execution result
-        sql_out = state.get("sql_execution_output")
-        dataset_summary = ""
-        if sql_out and sql_out.row_count is not None:
-            col_names = [c.get("name", str(c)) for c in (sql_out.columns or [])]
-            dataset_summary = (
-                f"\n\nSQL execution result: {sql_out.row_count} rows, columns={col_names}"
-            )
-
-        artifact_note = ""
-        if python_out and python_out.artifacts:
-            artifact_note = "\n\nGenerated artifacts (charts/files):\n" + "\n".join(
-                python_out.artifacts
-            )
-
+        summary = state.get("summary") or ""
         messages = [
             SystemMessage(content=FINAL_ANSWER_SYSTEM_PROMPT),
             HumanMessage(
                 content=f"""
 User question:
-{state['messages'][0].content}
+{state["messages"][0].content}
 
-Execution outputs:
-{exec_str}{dataset_summary}{artifact_note}
+Summary of execution results:
+{summary}
 """
             ),
         ]
@@ -610,6 +607,79 @@ Execution outputs:
             "final_answer": response.content,
             "messages": [AIMessage(content=response.content)],
         }
+
+
+class SummarizeExecResult:
+    """Prepares the SQL execution result for the final answer node.
+
+    - row_count <= 50 : serialises the full rows list as a JSON string.
+    - row_count >  50 : runs DuckDB SUMMARIZE on the parquet file and converts
+                        the statistical summary to a compact string so the LLM
+                        receives meaningful data without being flooded with rows.
+    """
+
+    def __call__(self, state: AgentState) -> dict:
+        sql_execution_output = state.get("sql_execution_output")
+        if sql_execution_output is None:
+            # This node is only reached after a successful SQL execution, so
+            # this path should never be hit. Log and return a no-op update.
+            logger.warning(
+                "[SummarizeExecResult] Called with no sql_execution_output — skipping"
+            )
+            return {}
+
+        row_count = sql_execution_output.row_count or 0
+
+        logger.debug("[SummarizeExecResult] START | row_count=%d", row_count)
+
+        if row_count <= 50:
+            logger.debug(
+                "[SummarizeExecResult] Row count within threshold — passing full rows as JSON"
+            )
+            result = json.dumps(sql_execution_output.rows)
+        else:
+            dataset = state["datasets"].get(sql_execution_output.id)
+            if dataset is None:
+                logger.warning(
+                    "[SummarizeExecResult] Dataset %r not found in state",
+                    sql_execution_output.id,
+                )
+
+                return {"summary": "No results"}
+
+            parquet_path = dataset.storage_path
+            logger.debug(
+                "[SummarizeExecResult] Row count exceeds threshold — "
+                "running DuckDB SUMMARIZE on %s",
+                parquet_path,
+            )
+            try:
+                summary_rel = duckdb.sql(
+                    f"SUMMARIZE SELECT * FROM read_parquet('{parquet_path}');"
+                )
+                # Convert the DuckDBPyRelation to a human-readable string table
+                result = summary_rel.df().to_string(index=False)
+                logger.debug(
+                    "[SummarizeExecResult] SUMMARIZE complete (%d chars)", len(result)
+                )
+            except (OSError, ValueError, AttributeError, duckdb.Error) as exc:
+                logger.warning(
+                    "[SummarizeExecResult] DuckDB SUMMARIZE failed (%s) — "
+                    "falling back to column metadata",
+                    exc,
+                )
+                col_names = [
+                    c.get("name", str(c)) for c in (sql_execution_output.columns or [])
+                ]
+                result = (
+                    f"SQL result too large to display in full "
+                    f"({row_count} rows). Columns: {col_names}"
+                )
+
+        logger.debug(
+            "[SummarizeExecResult] final_execution_result set (%d chars)", len(result)
+        )
+        return {"summary": result}
 
 
 def ast_eval_node(state: AgentState) -> dict:
@@ -633,13 +703,13 @@ def ast_eval_node(state: AgentState) -> dict:
         logger.warning("[ast_eval_node] SyntaxError during AST parse: %s", e)
         return {
             "ast_violation": True,
-            "execution_error": f"SyntaxError in generated code: {str(e)}",
+            "execution_error": f"SyntaxError in generated code: {e!s}",
         }
     except ValueError as e:
         logger.warning("[ast_eval_node] AST VIOLATION detected: %s", e)
         return {
             "ast_violation": True,
-            "execution_error": f"AST Security Violation: {str(e)}",
+            "execution_error": f"AST Security Violation: {e!s}",
         }
 
 
@@ -747,3 +817,35 @@ def step_router(state: AgentState) -> str:
         len(steps),
     )
     return _Route.NEXT_STEP
+
+
+def code_type_router(state: AgentState) -> str:
+    """
+    Routes based on the type of the last executed step, called after all steps
+    have completed (step_router → done).
+
+    - SQL_QUERY → summarize_execution_result → final_formatting
+    - PYTHON    → final_formatting directly
+
+    "ANSWER" steps are consumed by step_router before we reach here; encountering
+    one is a programming error.
+    """
+    current_step_index = state["current_step_index"]
+    code_type = state["plan"].steps[current_step_index].type
+
+    if code_type == "SQL_QUERY":
+        route = _Route.SQL
+    elif code_type == "PYTHON":
+        route = _Route.PYTHON
+    else:
+        raise ValueError(
+            f"[code_type_router] Unexpected step type {code_type!r} at index "
+            f"{current_step_index} — only SQL_QUERY and PYTHON are executable"
+        )
+
+    logger.debug(
+        "[code_type_router] code_type=%r → route=%r",
+        code_type,
+        route,
+    )
+    return route

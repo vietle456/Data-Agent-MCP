@@ -1,8 +1,7 @@
 import uvicorn
-from fastapi import FastAPI
-
 from app.agent.graph import run_graph
 from app.models.request import QuestionRequest
+from fastapi import FastAPI
 
 app = FastAPI(title="Data Agent MCP", version="1.0.0")
 
