@@ -127,12 +127,16 @@ TOOL-SELECTION RULES (CRITICAL — follow strictly)
 EXAMPLES
 ───────────────────────────────────────────────
 
-Example 1 — aggregation + max selection in ONE SQL step:
+Example 1 — aggregation + comparison in ONE SQL step:
   User: "Which region (NA, EU, JP, Other) generates the most revenue overall?"
   Correct plan:
-    Step 1 [SQL_QUERY]: Calculate total revenue for each region and identify the region with the highest revenue (ORDER BY … LIMIT 1 or window function — all in one query).
-    Step 2 [ANSWER]:    State the winning region and its total revenue.
-  Do NOT create a separate SQL step just to find the maximum after aggregating.
+    Step 1 [SQL_QUERY]: Calculate total revenue for each region (NA, EU, JP, Other) by summing
+                        the respective sales columns, returning ALL regions ordered by revenue DESC
+                        so the answer can include a full breakdown. Do NOT use LIMIT 1.
+    Step 2 [ANSWER]:    State which region has the highest revenue and provide the full breakdown
+                        of all regions for context.
+  Do NOT use LIMIT 1 on aggregation queries that answer comparative or ranking questions —
+  always return all groups so the final answer can provide complete context.
 
 Example 2 — SQL retrieves data, Python handles advanced statistics in ONE step:
   User: "Load the sales data and compute the Pearson correlation between critic score and global sales."
@@ -198,8 +202,12 @@ CRITICAL CONSTRAINT — SQL ONLY:
 
 SQL rules:
   - Write read-only SELECT statements only. No INSERT, UPDATE, DELETE, DROP, or DDL.
-  - Always include a LIMIT clause (max 500 rows) unless the step explicitly requires aggregation \
-    over all rows.
+  - Always include a LIMIT clause (max 500 rows) for row-level queries that retrieve
+    individual records.
+  - NEVER use LIMIT 1 on aggregation/GROUP BY queries that answer comparative or ranking
+    questions (e.g. "which region has the most...", "top genre by...", "highest/lowest...").
+    Return ALL groups so the final answer can provide a complete breakdown with context.
+    LIMIT 1 on aggregations hides the data needed to explain *why* a winner is a winner.
   - Use only columns and tables that appear in the provided schema.
   - SQL is the right tool for ALL data manipulation: filtering, selecting, grouping, aggregating,
     joining, sorting, window functions, and any built-in statistical functions the database
@@ -238,20 +246,29 @@ Python rules:
   - Do not import libraries outside the standard data science stack \
     (pandas, numpy, scipy, matplotlib, plotly, sklearn).
 
-stdout output rules (MANDATORY):
-  - Visualization goal: after saving all charts/plots, print a short success message to stdout
-    confirming that the file(s) were created else inform error during saving process, e.g.:
+Output contract — use the correct channel for each type of result:
 
-    Success:
-      print("Chart has been saved successfully")
+  - `analysis_result` (MANDATORY for math/statistics goals):
+      Assign a dict or list named `analysis_result` as a module-level variable with compact,
+      structured findings relevant to answering the question. The sandbox runner will
+      automatically extract this variable after execution. Keep values JSON-serialisable
+      (use float(), int(), list() — not numpy scalars). Example:
 
-    Failure:
-      print("Error during saving process")
+        analysis_result = {
+            "pearson_correlation": float(r),
+            "p_value": float(p),
+            "sample_size": int(n),
+        }
 
-  - Advanced math/statistics goal: print the computed result(s) directly to stdout so they are
-    visible in the execution output, e.g.:
-      print(f"Pearson correlation: {r:.4f}, p-value: {p:.4e}")
-    Use clear labels so the output is human-readable.
+      Do NOT set `analysis_result` for visualization-only goals — set it to `None` or omit it.
+
+  - `artifacts` (for visualization goals):
+      Save every chart/plot to `/workspace/output/<filename>`. The sandbox runner automatically
+      collects all files written there. Do NOT assign `artifacts` yourself.
+
+  - `stdout` (debug/confirmation messages ONLY):
+      Use `print()` solely for brief status messages (e.g. "Chart saved successfully").
+      Do NOT print full DataFrames, large arrays, or the full analysis result to stdout.
 
 Output ONLY the raw Python script — no markdown fences, no explanations, no comments outside the code.
 """.strip()

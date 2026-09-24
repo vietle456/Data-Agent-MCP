@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+
 from mcp import StdioServerParameters
 
 # Root of the backend package (the directory that contains the 'app' package)

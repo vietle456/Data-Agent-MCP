@@ -1,5 +1,6 @@
-from typing import Any
 import ast
+from typing import Any
+
 import sqlglot
 from sqlglot import expressions as exp
 from sqlglot.errors import ParseError

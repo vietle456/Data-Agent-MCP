@@ -20,6 +20,8 @@ dependencies = [
     "langsmith[openai-agents]>=0.13.0",
     "sqlglot>=30.18.0",
     "langchain-mcp-adapters>=0.3.2",
+    "fastmcp>=3.4.7",
+    "pyarrow>=25.0.1",
 ]
 
 [tool.setuptools.packages.find]
@@ -29,3 +31,41 @@ where = ["."]
 pythonpath = ["."]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.8",
+    "ty>=0.0.83",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+extend-exclude = [
+    ".venv",
+    "build",
+    "dist",
+    "__pycache__",
+    ".git",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+    "B",
+    "UP",
+    "SIM",
+]
+
+ignore = [
+    "E501",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+preview = false

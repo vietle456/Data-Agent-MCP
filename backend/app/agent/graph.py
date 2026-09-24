@@ -1,3 +1,11 @@
+from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage
+from langchain_mcp_adapters.tools import load_mcp_tools
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END, StateGraph
+from mcp import ClientSession
+from mcp.client.stdio import stdio_client
+
 from app.agent.nodes import (
     CodeExecNode,
     CodeGenNode,
@@ -19,13 +27,6 @@ from app.agent.state import AgentState
 from app.core.config import MCP_SERVER_PARAMS
 from app.core.logging_config import get_logger
 from app.models.plan import Plan
-from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage
-from langchain_mcp_adapters.tools import load_mcp_tools
-from langchain_openai import ChatOpenAI
-from langgraph.graph import END, StateGraph
-from mcp import ClientSession
-from mcp.client.stdio import stdio_client
 
 load_dotenv()
 
@@ -74,7 +75,6 @@ async def run_graph(question: str) -> dict:
             "sql_execution_output": None,
             "python_execution_output": None,
             "execution_error": None,
-            "summary": None,
         }
 
         logger.debug("[run_graph] Invoking graph | question=%r", question)
@@ -90,7 +90,7 @@ async def run_graph(question: str) -> dict:
 
 def _build_state_graph(llm, mcp_tools):
     logger.debug("[_build_state_graph] Building state graph")
-    graph = StateGraph(AgentState)
+    graph = StateGraph(AgentState)  # type: ignore
 
     # ── Nodes ─────────────────────────────────────────────────────────────────
     graph.add_node("planner", PlannerNode(llm, mcp_tools))
@@ -103,6 +103,7 @@ def _build_state_graph(llm, mcp_tools):
     graph.add_node("direct_answer", DirectAnswerNode(llm))
     graph.add_node("final_formatting", FinalFormattingNode(llm))
     graph.add_node("fallback_failure", fallback_failure_node)
+    graph.add_node("code_type_router", lambda state: state)  # passthrough routing node
 
     graph.set_entry_point("planner")
 

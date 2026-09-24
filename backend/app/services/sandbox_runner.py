@@ -2,10 +2,11 @@ import logging
 import tempfile
 from pathlib import Path
 
-import docker
 import docker.errors
+import requests.exceptions
 
-from app.core.config import UPLOADS_PATH, SQL_RESULTS_PATH, ARTIFACTS_PATH
+import docker
+from app.core.config import ARTIFACTS_PATH, SQL_RESULTS_PATH, UPLOADS_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -102,32 +103,32 @@ class SandboxRunner:
                 if container:
                     try:
                         container.kill()
-                    except Exception:
-                        pass
-            except Exception as e:
-                if "timed out" in str(e).lower():
-                    logger.warning(
-                        "[SandboxRunner] Container execution timed out: %s", e
-                    )
-                    exit_code = 124
-                else:
-                    logger.error(
-                        "[SandboxRunner] Unexpected error during container execution: %s",
-                        e,
-                    )
-                    exit_code = 1
+                    except docker.errors.APIError as kill_err:
+                        logger.warning(
+                            "[SandboxRunner] Failed to kill container during cleanup: %s",
+                            kill_err,
+                        )
+            except requests.exceptions.ReadTimeout as e:
+                logger.warning("[SandboxRunner] Container execution timed out: %s", e)
+                exit_code = 124
                 stderr_str = str(e)
                 if container:
                     try:
                         container.kill()
-                    except Exception:
-                        pass
+                    except docker.errors.APIError as kill_err:
+                        logger.debug(
+                            "[SandboxRunner] Failed to kill container after timeout: %s",
+                            kill_err,
+                        )
             finally:
                 if container:
                     try:
                         container.remove(force=True)
-                    except Exception:
-                        pass
+                    except docker.errors.APIError as remove_err:
+                        logger.debug(
+                            "[SandboxRunner] Failed to remove container during cleanup: %s",
+                            remove_err,
+                        )
 
         # 3. Collect Python-produced artifact paths only (new files under ARTIFACTS_PATH).
         #    SQL result files written to SQL_RESULTS_PATH are intentionally excluded.

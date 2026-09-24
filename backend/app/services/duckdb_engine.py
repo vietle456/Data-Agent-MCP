@@ -1,6 +1,6 @@
 import json
-from typing import Optional
 from pathlib import Path
+
 import duckdb
 import sqlglot
 from sqlglot import expressions as exp
@@ -9,7 +9,7 @@ from sqlglot import expressions as exp
 class DuckDBEngine:
     """Service wrapper for DuckDB analytical database operations."""
 
-    def __init__(self, db_path: Optional[str | Path] = None):
+    def __init__(self, db_path: str | Path | None = None):
         # In-memory database or disk-persisted .duckdb file
         self.db_path = db_path or ":memory:"
         self.conn = duckdb.connect(database=self.db_path)
@@ -18,9 +18,19 @@ class DuckDBEngine:
         """Dynamically ingests CSV or Parquet into DuckDB table."""
         suffix = file_path.suffix.lower()
         if suffix == ".csv":
-            query = (
-                f"CREATE TABLE '{table_name}' AS SELECT * FROM read_csv('{file_path}');"
-            )
+            # Map common null-sentinel strings to SQL NULL so DuckDB can infer
+            # correct column types (e.g. BIGINT instead of VARCHAR).
+            # This covers the most common representations across real-world CSVs
+            # and is dataset-agnostic — no per-file configuration needed.
+            _NULL_STRINGS = [
+                "N/A", "n/a", "NA", "na",
+                "NULL", "null", "Null",
+                "None", "none", "NONE",
+                "NaN", "nan",
+                "", "-", "?",
+            ]
+            null_list = "[" + ", ".join(f"'{s}'" for s in _NULL_STRINGS) + "]"
+            query = f"CREATE TABLE '{table_name}' AS SELECT * FROM read_csv('{file_path}', nullstr={null_list});"
         elif suffix == ".parquet":
             query = f"CREATE TABLE '{table_name}' AS SELECT * FROM read_parquet('{file_path}');"
         else:
@@ -41,7 +51,7 @@ class DuckDBEngine:
 
             # Fetch sample rows
             rows = self.conn.execute(f"SELECT * FROM {table_name} LIMIT 3").fetchall()
-            samples = [dict(zip([c[0] for c in col_info], row)) for row in rows]
+            samples = [dict(zip([c[0] for c in col_info], row, strict=False)) for row in rows]
 
             schema_info[table_name] = {"columns": columns, "sample_rows": samples}
         return json.dumps(schema_info, indent=2)
@@ -53,7 +63,7 @@ class DuckDBEngine:
             tree = sqlglot.parse_one(query, dialect="duckdb")
 
             if not isinstance(tree, exp.Query):
-                raise ValueError("Only query statements are allowed")
+                raise TypeError("Only query statements are allowed")
 
             if tree.args.get("limit") is None:
                 tree = tree.limit(max_rows)
@@ -64,13 +74,11 @@ class DuckDBEngine:
             cursor = self.conn.execute(query)
 
             # column name + declared type from the cursor description
-            columns = [
-                {"name": desc[0], "type": str(desc[1])} for desc in cursor.description
-            ]
+            columns = [{"name": desc[0], "type": str(desc[1])} for desc in cursor.description]
             col_names = [c["name"] for c in columns]
 
             # raw list-of-tuples
-            rows = [dict(zip(col_names, row)) for row in cursor.fetchall()]
+            rows = [dict(zip(col_names, row, strict=False)) for row in cursor.fetchall()]
 
             # lightweight numeric summary computed from raw values
             summary: dict = {"row_count": len(rows)}
@@ -91,7 +99,7 @@ class DuckDBEngine:
                 "rows": rows,
                 "summary": summary,
             }
-        except Exception as e:  # pylint: disable=broad-except
+        except (sqlglot.errors.SqlglotError, TypeError, duckdb.Error) as e:
             return {"success": False, "error": str(e)}
 
     def close(self):

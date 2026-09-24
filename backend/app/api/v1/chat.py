@@ -1,13 +1,18 @@
 from fastapi import APIRouter
+from pydantic import BaseModel
+
+from app.agent.graph import run_graph
+from app.models.request import QuestionRequest
 
 router = APIRouter(prefix="/chat")
 
 
-@router.post("/generate")
-def generate_answer(prompt: str):
+class LLMResponse(BaseModel):
+    answer: str
 
-    response = agent.invoke(
-        {"messages": [HumanMessage(content=request.prompt)]},
-        {"configurable": {"thread_id": thread_id}},
-    )
-    return LLMResponse(answer=response["messages"][-1].content)
+
+@router.post("/generate", response_model=LLMResponse)
+async def generate_answer(request: QuestionRequest) -> LLMResponse:
+    result = await run_graph(request.question)
+    answer = result.get("final_answer", "")
+    return LLMResponse(answer=answer)

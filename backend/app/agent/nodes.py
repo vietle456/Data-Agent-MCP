@@ -5,6 +5,8 @@ from pathlib import Path
 
 import duckdb
 import pandas as pd
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
 from app.agent.state import AgentState
 from app.core.config import SQL_RESULTS_PATH
 from app.core.logging_config import get_logger
@@ -20,7 +22,6 @@ from app.prompt.prompt import (
     FINAL_ANSWER_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT,
 )
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 logger = get_logger(__name__)
 
@@ -54,11 +55,7 @@ class PlannerNode:
     def __init__(self, llm, mcp_tools: list | None = None) -> None:
         self.llm = llm
         self._schema_tool = next(
-            (
-                t
-                for t in (mcp_tools or [])
-                if getattr(t, "name", None) == "inspect_db_schema"
-            ),
+            (t for t in (mcp_tools or []) if getattr(t, "name", None) == "inspect_db_schema"),
             None,
         )
 
@@ -71,17 +68,14 @@ class PlannerNode:
             schema_context = await self._schema_tool.ainvoke({})
             logger.debug("[PlannerNode] Schema fetched (%d chars)", len(schema_context))
         else:
-            logger.warning(
-                "[PlannerNode] No schema tool found — proceeding without schema"
-            )
+            logger.warning("[PlannerNode] No schema tool found — proceeding without schema")
             schema_context = ""
 
         # ainvoke may return a list of content items (LangChain MCP adapter behaviour)
         # — coerce to a plain string before any further processing.
         if not isinstance(schema_context, str):
             schema_context = "\n".join(
-                item.text if hasattr(item, "text") else str(item)
-                for item in schema_context
+                item.text if hasattr(item, "text") else str(item) for item in schema_context
             )
             logger.debug(
                 "[PlannerNode] schema_context coerced from list to str (%d chars)",
@@ -107,9 +101,7 @@ class PlannerNode:
         else:
             schema_section = f"\n\nDatabase schema:\n{schema_context}"
 
-        question_with_schema = (
-            f"User question: {state['messages'][-1].content}{schema_section}"
-        )
+        question_with_schema = f"User question: {state['messages'][-1].content}{schema_section}"
 
         messages = [
             SystemMessage(content=PLANNER_SYSTEM_PROMPT),
@@ -136,9 +128,7 @@ class PlannerNode:
                 exc,
                 content,
             )
-            raise RuntimeError(
-                f"Planner LLM returned an invalid JSON plan: {exc}"
-            ) from exc
+            raise RuntimeError(f"Planner LLM returned an invalid JSON plan: {exc}") from exc
 
         logger.debug(
             "[PlannerNode] Plan generated | intent=%r, steps=%d",
@@ -220,15 +210,17 @@ Use `pd.read_parquet("{parquet_ref}")` to load this dataset.\
 """
             else:
                 # Artifact or sql_execution_output not found in state (edge case)
-                prev_output_section = (
-                    "Previous step result (SQL query): No output available"
-                )
+                prev_output_section = "Previous step result (SQL query): No output available"
         elif prev_step_type == "PYTHON":
             python_output = state.get("python_execution_output")
-            stdout = python_output.stdout if python_output else None
-            if stdout:
+            if python_output and python_output.analysis_result is not None:
+                analysis_json = json.dumps(python_output.analysis_result, indent=2)
                 prev_output_section = (
-                    f"Previous step result (Python script stdout):\n{stdout}"
+                    f"Previous step result (Python analysis_result):\n{analysis_json}"
+                )
+            elif python_output and python_output.stdout:
+                prev_output_section = (
+                    f"Previous step result (Python script stdout):\n{python_output.stdout}"
                 )
             else:
                 prev_output_section = "No previous step output"
@@ -377,6 +369,7 @@ class CodeExecNode:
                 columns=sql_result.get("columns", []),
                 rows=rows,
                 row_count=row_count,
+                summary=None,
             )
 
             # Add execution output to messages so the next code_gen step can reference it
@@ -421,13 +414,15 @@ class CodeExecNode:
             stdout = result.get("stdout", "") or ""
             stderr = result.get("stderr", "") or ""
             artifacts = result.get("artifacts", [])
+            analysis_result = result.get("analysis_result", None)
 
             logger.debug(
-                "[CodeExecNode] Python execution complete | exit_code=%d, stdout_len=%d, stderr_len=%d, artifacts=%s",
+                "[CodeExecNode] Python execution complete | exit_code=%d, stdout_len=%d, stderr_len=%d, artifacts=%s, has_analysis_result=%s",
                 exit_code,
                 len(stdout),
                 len(stderr),
                 artifacts,
+                analysis_result is not None,
             )
             if stdout:
                 logger.debug(
@@ -436,18 +431,22 @@ class CodeExecNode:
                 )
             if stderr:
                 logger.debug("[CodeExecNode] stderr:\n%s", stderr)
+            if analysis_result is not None:
+                logger.debug(
+                    "[CodeExecNode] analysis_result: %s",
+                    json.dumps(analysis_result)[:500],
+                )
 
             python_exec_output = PythonExecutionResult(
                 success=exit_code == 0,
                 stdout=stdout,  # str, required — already defaulted to "" above
                 stderr=stderr if stderr else None,
                 artifacts=artifacts,
+                analysis_result=analysis_result,
             )
 
             # Add execution output to messages so the next code_gen step can reference it
-            output_message = HumanMessage(
-                content=f"Step {step_num} execution output:\n{stdout}"
-            )
+            output_message = HumanMessage(content=f"Step {step_num} execution output:\n{stdout}")
 
             return {
                 "python_execution_output": python_exec_output,
@@ -564,9 +563,7 @@ Guidance:
         logger.debug("[DirectAnswerNode] Calling LLM for direct answer")
         response = await self.llm.ainvoke(messages)
 
-        logger.debug(
-            "[DirectAnswerNode] Answer generated (%d chars)", len(response.content)
-        )
+        logger.debug("[DirectAnswerNode] Answer generated (%d chars)", len(response.content))
 
         return {
             "final_answer": response.content,
@@ -581,16 +578,60 @@ class FinalFormattingNode:
         self.llm = llm
 
     async def __call__(self, state: AgentState) -> dict:
-        summary = state.get("summary") or ""
+        # Determine the last executed step type to pick the right execution result.
+        steps = state["plan"].steps
+        last_exec_step = next(
+            (s for s in reversed(steps) if s.type in ("SQL_QUERY", "PYTHON")),
+            None,
+        )
+        last_step_type = last_exec_step.type if last_exec_step else None
+
+        if last_step_type == "PYTHON":
+            python_output = state.get("python_execution_output")
+            if python_output and python_output.analysis_result is not None:
+                execution_context_label = (
+                    "Analysis result (structured findings from Python execution):"
+                )
+                execution_context = json.dumps(python_output.analysis_result, indent=2)
+            elif python_output and python_output.artifacts:
+                execution_context_label = "Artifacts generated by Python execution:"
+                execution_context = "\n".join(python_output.artifacts)
+            else:
+                execution_context_label = "Python execution output:"
+                execution_context = (python_output.stdout if python_output else None) or "No output"
+            logger.debug(
+                "[FinalFormattingNode] Python path | has_analysis_result=%s, artifacts=%s",
+                python_output.analysis_result is not None if python_output else False,
+                python_output.artifacts if python_output else [],
+            )
+        else:  # SQL_QUERY or fallback
+            sql_output = state.get("sql_execution_output")
+            execution_context_label = "Summary of SQL execution results:"
+            execution_context = (sql_output.summary if sql_output else None) or ""
+            logger.debug(
+                "[FinalFormattingNode] SQL path | summary_len=%d",
+                len(execution_context),
+            )
+
+        # Retrieve the planner's ANSWER step description as synthesis guidance.
+        # This tells the LLM *what* the answer should address, preventing it from
+        # claiming data is missing when the result set is intentionally scoped.
+        answer_guidance = next((s.description for s in steps if s.type == "ANSWER"), "")
+        guidance_section = (
+            f"\nPlanner guidance (what the answer must address):\n{answer_guidance}\n"
+            if answer_guidance
+            else ""
+        )
+
         messages = [
             SystemMessage(content=FINAL_ANSWER_SYSTEM_PROMPT),
             HumanMessage(
                 content=f"""
 User question:
 {state["messages"][0].content}
-
-Summary of execution results:
-{summary}
+{guidance_section}
+{execution_context_label}
+{execution_context}
 """
             ),
         ]
@@ -623,9 +664,7 @@ class SummarizeExecResult:
         if sql_execution_output is None:
             # This node is only reached after a successful SQL execution, so
             # this path should never be hit. Log and return a no-op update.
-            logger.warning(
-                "[SummarizeExecResult] Called with no sql_execution_output — skipping"
-            )
+            logger.warning("[SummarizeExecResult] Called with no sql_execution_output — skipping")
             return {}
 
         row_count = sql_execution_output.row_count or 0
@@ -645,7 +684,8 @@ class SummarizeExecResult:
                     sql_execution_output.id,
                 )
 
-                return {"summary": "No results"}
+                sql_execution_output.summary = "No results"
+                return {"sql_execution_output": sql_execution_output}
 
             parquet_path = dataset.storage_path
             logger.debug(
@@ -654,32 +694,25 @@ class SummarizeExecResult:
                 parquet_path,
             )
             try:
-                summary_rel = duckdb.sql(
-                    f"SUMMARIZE SELECT * FROM read_parquet('{parquet_path}');"
-                )
+                summary_rel = duckdb.sql(f"SUMMARIZE SELECT * FROM read_parquet('{parquet_path}');")
                 # Convert the DuckDBPyRelation to a human-readable string table
                 result = summary_rel.df().to_string(index=False)
-                logger.debug(
-                    "[SummarizeExecResult] SUMMARIZE complete (%d chars)", len(result)
-                )
+                logger.debug("[SummarizeExecResult] SUMMARIZE complete (%d chars)", len(result))
             except (OSError, ValueError, AttributeError, duckdb.Error) as exc:
                 logger.warning(
                     "[SummarizeExecResult] DuckDB SUMMARIZE failed (%s) — "
                     "falling back to column metadata",
                     exc,
                 )
-                col_names = [
-                    c.get("name", str(c)) for c in (sql_execution_output.columns or [])
-                ]
+                col_names = [c.get("name", str(c)) for c in (sql_execution_output.columns or [])]
                 result = (
                     f"SQL result too large to display in full "
                     f"({row_count} rows). Columns: {col_names}"
                 )
 
-        logger.debug(
-            "[SummarizeExecResult] final_execution_result set (%d chars)", len(result)
-        )
-        return {"summary": result}
+        logger.debug("[SummarizeExecResult] final_execution_result set (%d chars)", len(result))
+        sql_execution_output.summary = result
+        return {"sql_execution_output": sql_execution_output}
 
 
 def ast_eval_node(state: AgentState) -> dict:
@@ -830,17 +863,29 @@ def code_type_router(state: AgentState) -> str:
     "ANSWER" steps are consumed by step_router before we reach here; encountering
     one is a programming error.
     """
-    current_step_index = state["current_step_index"]
-    code_type = state["plan"].steps[current_step_index].type
+    # current_step_index points at/past the ANSWER step once all steps are done,
+    # so walk backwards to find the last actually-executed (SQL_QUERY / PYTHON) step.
+    steps = state["plan"].steps
+    executable_types = {"SQL_QUERY", "PYTHON"}
+    last_exec_step = next(
+        (s for s in reversed(steps) if s.type in executable_types),
+        None,
+    )
 
+    if last_exec_step is None:
+        raise ValueError(
+            "[code_type_router] No executable step (SQL_QUERY or PYTHON) found in plan"
+        )
+
+    code_type = last_exec_step.type
     if code_type == "SQL_QUERY":
         route = _Route.SQL
     elif code_type == "PYTHON":
         route = _Route.PYTHON
     else:
         raise ValueError(
-            f"[code_type_router] Unexpected step type {code_type!r} at index "
-            f"{current_step_index} — only SQL_QUERY and PYTHON are executable"
+            f"[code_type_router] Unexpected step type {code_type!r} — "
+            "only SQL_QUERY and PYTHON are executable"
         )
 
     logger.debug(

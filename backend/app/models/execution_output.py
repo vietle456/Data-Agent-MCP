@@ -11,6 +11,7 @@ class SQLExecutionResult(ExecutionOutput):
     columns: list[dict]
     rows: list[dict]
     error: str | None
+    summary: str | None
 
 
 class PythonExecutionResult(ExecutionOutput):

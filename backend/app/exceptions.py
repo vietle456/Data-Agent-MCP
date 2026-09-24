@@ -7,6 +7,4 @@ class SqlResultTooLargeError(Exception):
     def __init__(self, row_count: int, limit: int = 100) -> None:
         self.row_count = row_count
         self.limit = limit
-        super().__init__(
-            f"SQL result is too large: got {row_count} rows, limit is {limit}"
-        )
+        super().__init__(f"SQL result is too large: got {row_count} rows, limit is {limit}")
