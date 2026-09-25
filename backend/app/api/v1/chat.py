@@ -2,7 +2,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from app.agent.graph import run_graph
-from app.models.request import QuestionRequest
+from app.schemas.request import QuestionRequest
 
 router = APIRouter(prefix="/chat")
 

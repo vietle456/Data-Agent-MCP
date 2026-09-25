@@ -26,7 +26,7 @@ from app.agent.nodes import (
 from app.agent.state import AgentState
 from app.core.config import MCP_SERVER_PARAMS
 from app.core.logging_config import get_logger
-from app.models.plan import Plan
+from app.schemas.plan import Plan
 
 load_dotenv()
 

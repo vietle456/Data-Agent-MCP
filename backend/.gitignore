@@ -47,6 +47,6 @@ htmlcov/
 .env
 
 # Local Database
-backend/storage
+storage
 
-backend/uv.lock
+uv.lock

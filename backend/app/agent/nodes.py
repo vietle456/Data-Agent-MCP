@@ -12,9 +12,6 @@ from app.core.config import SQL_RESULTS_PATH
 from app.core.logging_config import get_logger
 from app.core.security_ast import validate_python, validate_sql
 from app.exceptions import SqlResultTooLargeError
-from app.models.artifact_schema import DatasetArtifact
-from app.models.execution_output import PythonExecutionResult, SQLExecutionResult
-from app.models.plan import Plan
 from app.prompt.prompt import (
     CODE_GEN_PYTHON_SYSTEM_PROMPT,
     CODE_GEN_SQL_SYSTEM_PROMPT,
@@ -22,6 +19,9 @@ from app.prompt.prompt import (
     FINAL_ANSWER_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT,
 )
+from app.schemas.artifact_schema import DatasetArtifact
+from app.schemas.execution_output import PythonExecutionResult, SQLExecutionResult
+from app.schemas.plan import Plan
 
 logger = get_logger(__name__)
 

@@ -23,11 +23,21 @@ class DuckDBEngine:
             # This covers the most common representations across real-world CSVs
             # and is dataset-agnostic — no per-file configuration needed.
             _NULL_STRINGS = [
-                "N/A", "n/a", "NA", "na",
-                "NULL", "null", "Null",
-                "None", "none", "NONE",
-                "NaN", "nan",
-                "", "-", "?",
+                "N/A",
+                "n/a",
+                "NA",
+                "na",
+                "NULL",
+                "null",
+                "Null",
+                "None",
+                "none",
+                "NONE",
+                "NaN",
+                "nan",
+                "",
+                "-",
+                "?",
             ]
             null_list = "[" + ", ".join(f"'{s}'" for s in _NULL_STRINGS) + "]"
             query = f"CREATE TABLE '{table_name}' AS SELECT * FROM read_csv('{file_path}', nullstr={null_list});"

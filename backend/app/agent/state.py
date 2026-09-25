@@ -3,9 +3,9 @@ from typing import Annotated, TypedDict
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
-from app.models.artifact_schema import DatasetArtifact
-from app.models.execution_output import PythonExecutionResult, SQLExecutionResult
-from app.models.plan import Plan
+from app.schemas.artifact_schema import DatasetArtifact
+from app.schemas.execution_output import PythonExecutionResult, SQLExecutionResult
+from app.schemas.plan import Plan
 
 
 class AgentState(TypedDict):
